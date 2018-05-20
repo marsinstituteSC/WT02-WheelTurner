@@ -1,5 +1,5 @@
 /*
-This code controls the position of each wheel on the Viking 3 - T1 rover using the WT02 wheel turner module.
+This code controls the position of each wheel on the Viking 3 - T1 rover using the SS02 steering servo module.
 
 The module consits of a Hitec HS-755MG servo motor, a potensiometer to read the position, 
 an Arduino pro micro to controll the module and a MCP2515 CAN bus breakout board for the CAN bus communication.
@@ -9,18 +9,21 @@ relative to the rovers center point. The desired radius is read from the CAN bus
 through the modules PID controller. The actual angle of the wheel is sendt back to the motherboard as feedback.
 The module also sends status and error messages to enable the rovers high level of self diagnosis.
 
-
+NOTE: Remember to change the position and CAN message variables to the appropriate value for this steering servo
 
 
 
 Author: Rein Åsmund Torsvik, MISC 2018
 */
 
+
+
 //includes
 //_________________________________________________________________________________________________________________
 #include <SPI.h>
 #include <Servo.h>
 #include <Timer.h>
+#include "PID\PID_v1.h"
 #include "mcp_can.h"
 
 
@@ -28,39 +31,55 @@ Author: Rein Åsmund Torsvik, MISC 2018
 //constants
 //_________________________________________________________________________________________________________________
 #define CAN_CS_PIN		10
-
-#define GLOB_DRIVE		0x100
-#define WROT_FL_STAT	0x310
-#define WROT_FL_ANGL	0x311
-#define WROT_FL_PID		0x312
-
-#define WR02_POS_X		600 //Wheel rotaters x position relative to rovers center point in mm
-#define WR02_POS_Y		400 //Wheel rotaters x position relative to rovers center point in mm
-
 #define PIN_SERVO		9
 #define PIN_POT			A0
+
+#define GLOB_DRIVE		0x100
+#define STEER_XX_STAT	0x310
+#define STEER_XX_ANGL	0x311
+#define STEER_XX_PID	0x312
+#define STEED_XX_CAL	0x313
+
+#define SS02_POS_X		600 //Wheel rotaters x position relative to rovers center point in mm
+#define SS02_POS_Y		400 //Wheel rotaters x position relative to rovers center point in mm
+
+#define MAX_ANGLE		100	//Maximum alowed angle for steering servo (turning past this may damage module)
+#define MIN_ANGLE		-100//Minimum alowed angle for steering servo (turning past this may damage module)
+
+
+
+//message buffers
+//_________________________________________________________________________________________________________________
+byte buf_drive[6];
+byte buf_stat[2];
+byte buf_angl[2];
+byte buf_pid[8];
+byte buf_cal[4];
 
 
 //objects
 //_________________________________________________________________________________________________________________
 MCP_CAN CAN(CAN_CS_PIN);
+PID myPID(&pid_PV, &pid_CV, &pid_SP, 2, 5, 1, DIRECT);
 Servo servo;
 
 
 //global variables
 //_________________________________________________________________________________________________________________
-bool pastMaxAngle;
+bool pastMaxAngle;			//Servo past end points
+bool positionReached;		//Servo within +/-5 deg of set point
+int POTMINUS90DEG;			//Potensiometer analog value at -90deg
+int POTPLUS90DEG;			//Potensiometer analog value at +90deg
 
-byte status;
-byte alive;
+byte status;				//status byte
+byte alive;					//Wachdog (increment by 1/second)
 
-int angle;
+long radius;				//turning radius in mm (from center of rover)
 
-bool pid_man;	//PID control auto/man, 0 = auto, 1 = manual
+bool pid_man;				//PID control auto/man, 0 = auto, 1 = manual
+double pid_p, pid_i, pid_d;
+double pid_SP, pid_PV, pid_CV; //PID Setpoint and process value (in degrees) and control value
 
-int pid_p;
-int pid_i;
-int pid_d;
 
 
 
@@ -93,6 +112,9 @@ void setup()
 	//initialize variables
 	status = 0x01;
 	pid_man = false;
+	POTMINUS90DEG = 100;
+	POTPLUS90DEG = 924;
+
 
 
 }
@@ -103,6 +125,18 @@ void setup()
 //_________________________________________________________________________________________________________________
 void loop()
 {
+	//calculate angle SP from desired turning radius
+	pid_SP = radiusToDeg(radius);
+
+	//Read angle of steering servo
+	pid_PV = dmap(analogRead(PIN_POT), POTMINUS90DEG, POTPLUS90DEG, -90, 90);
+
+	//set status bits for angles
+	pastMaxAngle = (pid_PV < MIN_ANGLE || pid_PV > MAX_ANGLE);
+	positionReached = (pid_PV >= pid_SP - 5 || pid_PV <= pid_SP + 5);
+
+	bitWrite(buf_stat[0], 1, positionReached);
+	bitWrite(buf_stat[0], 2, pastMaxAngle);
 
 
 
@@ -165,4 +199,16 @@ void loop()
 	//runtime variables
 	alive = (millis() / 1000) % 256;
 
+}
+
+//radiusToDeg() converts the desired rover turning radius into desired angle using Ackerman steering formulas
+//including some conditions for logical positioning of wheels and rotating around your own axis. 
+double radiusToDeg(long radius)
+{
+
+}
+
+double dmap(double x, double in_min, double in_max, double out_min, double out_max)
+{
+	return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
