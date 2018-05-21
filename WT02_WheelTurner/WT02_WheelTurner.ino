@@ -18,11 +18,17 @@ Author: Rein Åsmund Torsvik, MISC 2018
 
 
 
+//HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK
+//det er kasnkje nødvendig å invertere vinkler fra venstre til høyre styreservo
+//HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK HUSK
+
+
+
 //includes
 //_________________________________________________________________________________________________________________
 #include <SPI.h>
 #include <Servo.h>
-#include <Timer.h>
+#include <math.h>
 #include "PID\PID_v1.h"
 #include "mcp_can.h"
 
@@ -45,6 +51,7 @@ Author: Rein Åsmund Torsvik, MISC 2018
 
 #define MAX_ANGLE		100	//Maximum alowed angle for steering servo (turning past this may damage module)
 #define MIN_ANGLE		-100//Minimum alowed angle for steering servo (turning past this may damage module)
+#define MAX_SPEED		0.5 //Maximum speed factor from the max speed of the servo motor.
 
 
 
@@ -89,6 +96,7 @@ unsigned long t_cantransmit_prev;
 int t_cantransmit_interval = 1000;
 
 
+
 //Setup
 //_________________________________________________________________________________________________________________
 void setup()
@@ -108,6 +116,9 @@ void setup()
 	Serial.print("Initializing servo...\t");
 	servo.attach(PIN_SERVO);
 	Serial.println("[DONE]");
+
+	//initialize PID
+	myPID.SetMode(AUTOMATIC);
 
 	//initialize variables
 	status = 0x01;
@@ -137,6 +148,10 @@ void loop()
 
 	bitWrite(buf_stat[0], 1, positionReached);
 	bitWrite(buf_stat[0], 2, pastMaxAngle);
+
+	//Compute control value
+	myPID.Compute();
+	analogWrite(PIN_SERVO, pid_CV*MAX_SPEED);
 
 
 
@@ -202,10 +217,12 @@ void loop()
 }
 
 //radiusToDeg() converts the desired rover turning radius into desired angle using Ackerman steering formulas
-//including some conditions for logical positioning of wheels and rotating around your own axis. 
 double radiusToDeg(long radius)
 {
+	double tan_phi = SS02_POS_X / (double)(radius - SS02_POS_Y);
+	double phi = atan(tan_phi) / (double)(2*PI)*360;
 
+	return phi;
 }
 
 double dmap(double x, double in_min, double in_max, double out_min, double out_max)
