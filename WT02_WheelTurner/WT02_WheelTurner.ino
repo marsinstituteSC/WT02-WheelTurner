@@ -29,7 +29,8 @@ Author: Rein Åsmund Torsvik, MISC 2018
 #include <SPI.h>
 #include <Servo.h>
 #include <math.h>
-#include "PID\PID_v1.h"
+#include <limits.h>
+#include "AutoPID\AutoPID.h"
 #include "mcp_can.h"
 
 
@@ -46,13 +47,22 @@ Author: Rein Åsmund Torsvik, MISC 2018
 #define STEER_XX_PID	0x312
 #define STEED_XX_CAL	0x313
 
+#define FRAMETYPE		0	//frame type of CAN bus. 0=stadard, 1=extended 
+
 #define SS02_POS_X		600 //Wheel rotaters x position relative to rovers center point in mm
 #define SS02_POS_Y		400 //Wheel rotaters x position relative to rovers center point in mm
 
-#define MAX_ANGLE		100	//Maximum alowed angle for steering servo (turning past this may damage module)
-#define MIN_ANGLE		-100//Minimum alowed angle for steering servo (turning past this may damage module)
-#define MAX_SPEED		0.5 //Maximum speed factor from the max speed of the servo motor.
+#define MAX_ANGLE		110	//Maximum alowed angle for steering servo (turning past this may damage module)
+#define MIN_ANGLE		-110//Minimum alowed angle for steering servo (turning past this may damage module)
+#define SERVO_ZERO		1580//Value at which servo potmeter is centered, must be calibrated
+#define MAX_SPEED		0.2 //Maximum speed factor from the max speed of the servo motor.
 
+#define PID_INIT_KP		10
+#define PID_INIT_KI		0
+#define PID_INIT_KD		0
+
+#define POTMINUS90DEG	820 //potensiometer value when steering servo at +90deg
+#define POTPLUS90DEG	170
 
 
 //message buffers
@@ -64,19 +74,13 @@ byte buf_pid[8];
 byte buf_cal[4];
 
 
-//objects
-//_________________________________________________________________________________________________________________
-MCP_CAN CAN(CAN_CS_PIN);
-PID myPID(&pid_PV, &pid_CV, &pid_SP, 2, 5, 1, DIRECT);
-Servo servo;
-
 
 //global variables
 //_________________________________________________________________________________________________________________
 bool pastMaxAngle;			//Servo past end points
 bool positionReached;		//Servo within +/-5 deg of set point
-int POTMINUS90DEG;			//Potensiometer analog value at -90deg
-int POTPLUS90DEG;			//Potensiometer analog value at +90deg
+int potMinus90deg;			//Potensiometer analog value at -90deg
+int potPlus90deg;			//Potensiometer analog value at +90deg
 
 byte status;				//status byte
 byte alive;					//Wachdog (increment by 1/second)
@@ -86,6 +90,7 @@ long radius;				//turning radius in mm (from center of rover)
 bool pid_man;				//PID control auto/man, 0 = auto, 1 = manual
 double pid_p, pid_i, pid_d;
 double pid_SP, pid_PV, pid_CV; //PID Setpoint and process value (in degrees) and control value
+char pid_CV_man;
 
 
 
@@ -94,6 +99,15 @@ double pid_SP, pid_PV, pid_CV; //PID Setpoint and process value (in degrees) and
 //_________________________________________________________________________________________________________________
 unsigned long t_cantransmit_prev;
 int t_cantransmit_interval = 1000;
+
+
+
+//objects
+//_________________________________________________________________________________________________________________
+MCP_CAN CAN(CAN_CS_PIN);
+AutoPID myPID(&pid_PV, &pid_SP, &pid_CV, -500*MAX_SPEED, 500*MAX_SPEED, PID_INIT_KP, PID_INIT_KI, PID_INIT_KD);
+//AutoPID myPID(&pid_PV, &pid_SP, &pid_CV, PID_MIN_CV, PID_MAX_CV, PID_INIT_KP, PID_INIT_KI, PID_INIT_KD);
+Servo servo;
 
 
 
@@ -112,19 +126,25 @@ void setup()
 	else
 		Serial.println("[SUCCESS]");
 
+	//init pins
+	pinMode(PIN_POT, INPUT);
+	pinMode(PIN_SERVO, OUTPUT);
+
 	//initialize servo
 	Serial.print("Initializing servo...\t");
 	servo.attach(PIN_SERVO);
 	Serial.println("[DONE]");
 
 	//initialize PID
-	myPID.SetMode(AUTOMATIC);
+	myPID.setTimeStep(100);
 
 	//initialize variables
 	status = 0x01;
 	pid_man = false;
-	POTMINUS90DEG = 100;
-	POTPLUS90DEG = 924;
+	pid_CV_man = 0;
+	potMinus90deg = POTMINUS90DEG;
+	potPlus90deg = POTPLUS90DEG;
+	radius = LONG_MIN;
 
 
 
@@ -136,78 +156,123 @@ void setup()
 //_________________________________________________________________________________________________________________
 void loop()
 {
+
+	//CAN Recieve
+	//_____________________________________________________________________________________________________________
+	if (CAN_MSGAVAIL == CAN.checkReceive())
+	{
+		//Read data
+		unsigned long ID;
+		byte rxlen = 0;
+		byte rxbuf[8];
+		CAN.readMsgBufID(&ID, &rxlen, rxbuf);
+
+		//handle data
+		switch (ID)
+		{
+		case GLOB_DRIVE:
+			radius = rxbuf[2] << 24 | rxbuf[3] << 16 | rxbuf[4] << 8 | rxbuf[5];
+			break;
+		case STEER_XX_PID:
+			pid_man = rxbuf[0] & 0x01;
+			pid_p = (rxbuf[1] << 8 | rxbuf[2]) / 100.0;
+			pid_i = (rxbuf[3] << 8 | rxbuf[4]) / 100.0;
+			pid_d = (rxbuf[5] << 8 | rxbuf[6]) / 100.0;
+			pid_CV_man = rxbuf[7];
+
+			myPID.setGains(pid_p, pid_i, pid_d);
+			break;
+		case STEED_XX_CAL:
+			potMinus90deg = (rxbuf[0] << 8 | rxbuf[1]);
+			potMinus90deg = (rxbuf[2] << 8 | rxbuf[3]);
+			break;
+		default:
+			break;
+		}
+
+		
+	}
+
+
+
+	//Position computations and handling
+	//_____________________________________________________________________________________________________________
+
 	//calculate angle SP from desired turning radius
 	pid_SP = radiusToDeg(radius);
 
 	//Read angle of steering servo
-	pid_PV = dmap(analogRead(PIN_POT), POTMINUS90DEG, POTPLUS90DEG, -90, 90);
+	pid_PV = dmap(analogRead(PIN_POT), potMinus90deg, potPlus90deg, -90, 90);
 
-	//set status bits for angles
-	pastMaxAngle = (pid_PV < MIN_ANGLE || pid_PV > MAX_ANGLE);
-	positionReached = (pid_PV >= pid_SP - 5 || pid_PV <= pid_SP + 5);
+	//Handle angle out of bounds
+	if ((pid_PV < MIN_ANGLE || pid_PV > MAX_ANGLE) && servo.attached())
+	{
+		pastMaxAngle = true;
+		servo.detach(); //if servo past max Angle, detach servo for safety
 
+		Serial.println("Servo detached");
+	}
+	//handle angle back within bounds (*0.2 for hysteresis)
+	else if ((pid_PV > MIN_ANGLE*0.2 && pid_PV < MAX_ANGLE*0.2) && !servo.attached())
+	{
+		servo.attach(PIN_SERVO);
+		Serial.println("Servo attached");
+	}
+	
+	positionReached = (pid_PV >= pid_SP - 5 && pid_PV <= pid_SP + 5);
+	
+	//set status bits
 	bitWrite(buf_stat[0], 1, positionReached);
 	bitWrite(buf_stat[0], 2, pastMaxAngle);
 
-	//Compute control value
-	myPID.Compute();
-	analogWrite(PIN_SERVO, pid_CV*MAX_SPEED);
 
 
 
-	//Recieve CAN messages
-	if (CAN_MSGAVAIL == CAN.checkReceive())
+	//PID Position control
+	//_____________________________________________________________________________________________________________
+
+	//AUTO
+	if (!pid_man)
+		myPID.run();
+	//MANUAL
+	else
+		pid_CV = (double)(500 * pid_CV_man / 100.0);
+
+	servo.writeMicroseconds(SERVO_ZERO + pid_CV);
+
+
+
+	
+
+	//CAN Transmit 
+	//_____________________________________________________________________________________________________________
+	if (millis() - t_cantransmit_prev > t_cantransmit_interval)
 	{
-		//Read data
-		CAN.readMsgBuf(&len, rxbuf);
+		CAN.sendMsgBuf(STEER_XX_STAT, FRAMETYPE, 2, buf_stat);
+		CAN.sendMsgBuf(STEER_XX_ANGL, FRAMETYPE, 2, buf_angl);
+		CAN.sendMsgBuf(STEER_XX_STAT, FRAMETYPE, 8, buf_pid);
+		CAN.sendMsgBuf(STEER_XX_STAT, FRAMETYPE, 4, buf_cal);
 
-		//Print data to serial
-		Serial.print("Recieved ID: ");
-		Serial.println(CAN.getCanId(), HEX);
-
-		for (int i = 0; i<len; i++)
-		{
-			Serial.print(txbuf[i], HEX);
-			Serial.print("\t");
-		}
+		Serial.print("r: ");
+		Serial.print(radius);
+		Serial.print(" a: ");
+		Serial.print(analogRead(PIN_POT));
+		Serial.print(" pos r: ");
+		Serial.print(positionReached);
+		Serial.print(" SP: ");
+		Serial.print(pid_SP);
+		Serial.print(" PV: ");
+		Serial.print(pid_PV);
+		Serial.print(" CV: ");
+		Serial.print(pid_CV);
+		Serial.print(" A/M: ");
+		Serial.print(pid_man);
+		Serial.print(" HB: ");
+		Serial.print(alive);
 		Serial.println();
+
+		t_cantransmit_prev = millis();
 	}
-
-	//Send CAN messages
-	unsigned long id = 0x100;	//Identifier
-	byte frametype = 0;			//0=stadard, 1=extended
-	byte len = 8;				//Data length
-	byte txbuf[8] = { 0x11, 0x22 ,0x33, 0x44, 0x55, 0x66, 0x77, 0xAA };
-
-	float fvalue = 3.14;
-	byte *b = (byte *)&fvalue;
-
-	txbuf[0] = b[0];
-	txbuf[1] = b[1];
-	txbuf[2] = b[2];
-	txbuf[3] = b[3];
-
-	int ivalue = 1337;
-
-	txbuf[4] = (byte)(ivalue >> 8);
-	txbuf[5] = (byte)(ivalue >> 0);
-
-
-
-
-	CAN.sendMsgBuf(id, frametype, len, txbuf);
-
-	byte fbytes[4];
-	fbytes[0] = rxbuf[0];
-	fbytes[1] = rxbuf[1];
-	fbytes[2] = rxbuf[2];
-	fbytes[3] = rxbuf[3];
-
-	float fvalue = *((float*)(fbytes));
-
-	int ivalue = (rxbuf[4] << 8) | (rxbuf[5] << 0);
-
-	//transmit can messages
 
 
 
